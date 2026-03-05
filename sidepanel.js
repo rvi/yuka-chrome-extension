@@ -1,6 +1,7 @@
 // === State ===
 let algoliaApiKey = null;
 let isScanning = false;
+let seenYukaIds = new Set(); // dedup by Yuka product ID across a scan
 
 // === DOM Elements ===
 const loginScreen = document.getElementById("login-screen");
@@ -20,8 +21,8 @@ const productsList = document.getElementById("products-list");
 
 // === Init ===
 async function init() {
-  const stored = await chrome.storage.local.get(["yukaToken", "algoliaApiKey"]);
-  if (stored.yukaToken && stored.algoliaApiKey) {
+  const stored = await chrome.storage.local.get(["algoliaApiKey"]);
+  if (stored.algoliaApiKey) {
     algoliaApiKey = stored.algoliaApiKey;
     showMainScreen();
   } else {
@@ -42,9 +43,15 @@ function showMainScreen() {
 
 // === Login ===
 loginBtn.addEventListener("click", async () => {
-  const token = tokenInput.value.trim();
-  if (!token) {
-    showError("Please enter your authentication token.");
+  const key = tokenInput.value.trim();
+  if (!key) {
+    showError("Please paste your Algolia API key.");
+    return;
+  }
+
+  // Basic sanity check: should be a long base64-like string
+  if (key.length < 40) {
+    showError("That doesn't look like a valid Algolia key — it should be a long base64 string.");
     return;
   }
 
@@ -52,47 +59,28 @@ loginBtn.addEventListener("click", async () => {
   hideError();
 
   try {
-    const response = await sendMessage({ type: "GENERATE_ALGOLIA_KEY", token });
+    // Validate by doing a quick live search against Algolia
+    const response = await sendMessage({ type: "VALIDATE_KEY", apiKey: key });
 
     if (!response.success) {
-      throw new Error(response.error || "Failed to authenticate");
+      const msg = response.error || "Key validation failed";
+      if (msg.includes("403")) {
+        throw new Error(
+          "Key rejected (403). Make sure you copied the full apiKey value from curl 3 — it's the long base64 string in the request body, not the Firebase token."
+        );
+      }
+      throw new Error(msg);
     }
 
-    // The response should contain the Algolia API key
-    const data = response.data;
-    algoliaApiKey = extractApiKey(data);
-
-    if (!algoliaApiKey) {
-      throw new Error("Could not extract API key from response");
-    }
-
-    // Store credentials
-    await chrome.storage.local.set({
-      yukaToken: token,
-      algoliaApiKey: algoliaApiKey,
-    });
-
+    algoliaApiKey = key;
+    await chrome.storage.local.set({ algoliaApiKey: key });
     showMainScreen();
   } catch (err) {
-    showError(`Authentication failed: ${err.message}`);
+    showError(err.message);
   } finally {
     setLoginLoading(false);
   }
 });
-
-function extractApiKey(data) {
-  // The key generation endpoint likely returns the key in various formats
-  if (typeof data === "string") return data;
-  if (data.apiKey) return data.apiKey;
-  if (data.key) return data.key;
-  if (data.data && data.data.apiKey) return data.data.apiKey;
-  if (data.data && data.data.key) return data.data.key;
-  // If the response is an object, try to find any key-like field
-  for (const [k, v] of Object.entries(data)) {
-    if (typeof v === "string" && v.length > 20) return v;
-  }
-  return null;
-}
 
 function setLoginLoading(loading) {
   loginBtn.disabled = loading;
@@ -111,7 +99,7 @@ function hideError() {
 
 // === Logout ===
 logoutBtn.addEventListener("click", async () => {
-  await chrome.storage.local.remove(["yukaToken", "algoliaApiKey"]);
+  await chrome.storage.local.remove(["algoliaApiKey"]);
   algoliaApiKey = null;
   tokenInput.value = "";
   productsList.innerHTML = "";
@@ -129,7 +117,12 @@ scanBtn.addEventListener("click", async () => {
   scanBtn.disabled = true;
 
   try {
-    const response = await sendMessage({ type: "EXTRACT_PRODUCTS" });
+    // Resolve the active tab from the side panel context, where currentWindow
+    // correctly refers to the browser window the panel is attached to.
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) throw new Error("Could not find the active tab.");
+
+    const response = await sendMessage({ type: "EXTRACT_PRODUCTS", tabId: tab.id });
 
     if (!response.success) {
       throw new Error(response.error || "Failed to extract products");
@@ -147,6 +140,7 @@ scanBtn.addEventListener("click", async () => {
     emptyState.classList.add("hidden");
     productsList.classList.remove("hidden");
     productsList.innerHTML = "";
+    seenYukaIds.clear();
 
     // Create placeholder cards
     for (const name of products) {
@@ -165,9 +159,9 @@ scanBtn.addEventListener("click", async () => {
 
       try {
         const result = await searchProduct(name);
-        updateProductCard(name, result);
+        updateProductCard(name, result ? result.hit : null, result ? result.matchedQuery : null);
       } catch (err) {
-        updateProductCard(name, null);
+        updateProductCard(name, null, null);
       }
 
       completed++;
@@ -217,9 +211,9 @@ async function doManualSearch() {
 
   try {
     const result = await searchProduct(query);
-    updateProductCard(query, result);
+    updateProductCard(query, result ? result.hit : null, result ? result.matchedQuery : null);
   } catch (err) {
-    updateProductCard(query, null);
+    updateProductCard(query, null, null);
   }
 
   hideStatus();
@@ -227,22 +221,83 @@ async function doManualSearch() {
 }
 
 // === API ===
-async function searchProduct(query) {
-  const response = await sendMessage({
-    type: "SEARCH_PRODUCTS",
-    apiKey: algoliaApiKey,
-    query: query,
-  });
 
-  if (!response.success) {
-    throw new Error(response.error);
+/**
+ * Build a ranked list of search queries to try for a product name.
+ *
+ * Strategy (in order):
+ *  1. Full name as-is
+ *  2. ALL-CAPS words joined (usually the brand: "NUTELLA", "COCA COLA")
+ *  3. Each individual ALL-CAPS word (e.g. just "NUTELLA")
+ *  4. Last 2 significant words (brand often trails in EU descriptions)
+ *  5. First 2 significant words
+ *  6. Single last significant word
+ *
+ * Duplicates and empty strings are removed.
+ */
+function buildSearchQueries(name) {
+  const queries = [name];
+
+  // ALL-CAPS words are almost always brand names on European product pages
+  const capsWords = (name.match(/\b[A-ZÀÂÄÉÈÊËÎÏÔÙÛÜÇ]{2,}\b/g) || []);
+  if (capsWords.length > 0) {
+    queries.push(capsWords.join(" "));        // e.g. "COCA COLA ZERO"
+    capsWords.forEach((w) => queries.push(w)); // e.g. "NUTELLA" alone
   }
 
-  const hits = response.data.hits || [];
-  if (hits.length === 0) return null;
+  // Significant words = length > 2, not pure stop-words
+  const stopWords = new Set([
+    "the","and","for","with","aux","les","des","une","et","de","du",
+    "le","la","au","en","par","sur","pas","non","per","con","von","mit",
+    "for","van","der","den","het","een","los","las","del","sin",
+  ]);
+  const sigWords = name
+    .split(/[\s,/|·•\-–—]+/)
+    .map((w) => w.replace(/[()[\]{}*&%$#@!?<>]/g, "").trim())
+    .filter((w) => w.length > 2 && !stopWords.has(w.toLowerCase()));
 
-  // Return best match
-  return hits[0];
+  if (sigWords.length >= 3) {
+    queries.push(sigWords.slice(0, 2).join(" "));           // first 2 sig words
+    queries.push(sigWords.slice(-2).join(" "));             // last 2 sig words
+  }
+  if (sigWords.length >= 2) {
+    queries.push(sigWords[sigWords.length - 1]);            // last sig word
+    queries.push(sigWords[0]);                              // first sig word
+  }
+
+  // Deduplicate (case-insensitive) while preserving order
+  const seen = new Set();
+  return queries.filter((q) => {
+    const k = q.toLowerCase().trim();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+/**
+ * Try each query in turn, stopping at the first that returns hits.
+ * Returns { hit, matchedQuery } or null.
+ */
+async function searchProduct(originalName) {
+  const queries = buildSearchQueries(originalName);
+
+  for (const query of queries) {
+    const response = await sendMessage({
+      type: "SEARCH_PRODUCTS",
+      apiKey: algoliaApiKey,
+      query,
+    });
+
+    if (!response.success) throw new Error(response.error);
+
+    const hits = response.data.hits || [];
+    if (hits.length > 0) {
+      return { hit: hits[0], matchedQuery: query };
+    }
+  }
+
+  return null; // nothing found across all fallbacks
 }
 
 // === UI Helpers ===
@@ -268,15 +323,27 @@ function createProductCard(name, product, loading = false) {
   return card;
 }
 
-function updateProductCard(searchName, product) {
+function updateProductCard(searchName, product, matchedQuery) {
   const card = productsList.querySelector(`[data-search-name="${CSS.escape(searchName)}"]`);
   if (!card) return;
 
+  // Deduplicate: if this Yuka product was already shown, remove the card silently
+  if (product) {
+    const yukaId = product.hashId || product.objectID || null;
+    if (yukaId) {
+      if (seenYukaIds.has(yukaId)) {
+        card.remove();
+        return;
+      }
+      seenYukaIds.add(yukaId);
+    }
+  }
+
   card.classList.remove("loading");
-  renderProductCard(card, searchName, product);
+  renderProductCard(card, searchName, product, matchedQuery);
 }
 
-function renderProductCard(card, searchName, product) {
+function renderProductCard(card, searchName, product, matchedQuery) {
   if (!product || product.grade == null) {
     card.innerHTML = `
       <div class="score-badge score-unknown">?</div>
@@ -290,15 +357,18 @@ function renderProductCard(card, searchName, product) {
 
   const score = product.grade;
   const { className, label } = getScoreInfo(score);
-  const name = product.name || searchName;
+  const yukaName = product.name || searchName;
   const brand = product.brand || "";
+
+  // Show which query actually matched if it was a fallback (not the original name)
+  const usedFallback = matchedQuery && matchedQuery.toLowerCase() !== searchName.toLowerCase();
 
   card.innerHTML = `
     <div class="score-badge ${className}">${Math.round(score)}</div>
     <div class="product-info">
-      <div class="product-name">${escapeHtml(name)}</div>
+      <div class="product-name">${escapeHtml(yukaName)}</div>
       ${brand ? `<div class="product-brand">${escapeHtml(brand)}</div>` : ""}
-      ${name.toLowerCase() !== searchName.toLowerCase() ? `<div class="searched-name">Searched: ${escapeHtml(searchName)}</div>` : ""}
+      ${usedFallback ? `<div class="searched-name">via "${escapeHtml(matchedQuery)}"</div>` : ""}
       <div class="product-score-label label-${className.replace("score-", "")}">${label}</div>
     </div>
   `;

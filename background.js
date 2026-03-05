@@ -6,10 +6,15 @@ chrome.action.onClicked.addListener(async (tab) => {
 // Set side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
+// Algolia constants
+const ALGOLIA_APP_ID = "M8UJG2X7HL";
+const ALGOLIA_ENDPOINT = `https://${ALGOLIA_APP_ID.toLowerCase()}-dsn.algolia.net/1/indexes/prod_product/query`;
+
 // Listen for messages from side panel and content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === "GENERATE_ALGOLIA_KEY") {
-    generateAlgoliaKey(message.token)
+  if (message.type === "VALIDATE_KEY") {
+    // Do a lightweight test search to validate the key
+    searchProducts(message.apiKey, "water")
       .then((data) => sendResponse({ success: true, data }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -23,59 +28,89 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "EXTRACT_PRODUCTS") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (!tabs[0]) {
-        sendResponse({ success: false, error: "No active tab" });
+    (async () => {
+      const tabId = message.tabId;
+      if (!tabId) {
+        sendResponse({ success: false, error: "No tab ID provided." });
         return;
       }
-      chrome.tabs.sendMessage(tabs[0].id, { type: "EXTRACT_PRODUCTS" }, (response) => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ success: false, error: chrome.runtime.lastError.message });
-        } else {
-          sendResponse(response);
-        }
-      });
-    });
+
+      // First attempt
+      const first = await sendToContentScript(tabId, { type: "EXTRACT_PRODUCTS" });
+      if (first !== null) {
+        sendResponse(first);
+        return;
+      }
+
+      // Content script not ready — inject it then retry once
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      } catch (err) {
+        sendResponse({ success: false, error: `Could not inject content script: ${err.message}` });
+        return;
+      }
+
+      const second = await sendToContentScript(tabId, { type: "EXTRACT_PRODUCTS" });
+      if (second !== null) {
+        sendResponse(second);
+      } else {
+        sendResponse({ success: false, error: "Content script did not respond after injection." });
+      }
+    })();
     return true;
   }
 });
 
-async function generateAlgoliaKey(token) {
-  const url = `https://goodtoucan.com/ALJPAW5/api/algolia/key/generate?token=${encodeURIComponent(token)}`;
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Accept": "*/*",
-      "X-Accept-Version": "3",
-      "User-Agent": "Yuka/4.81 (yuca.scanner; build:1997; iOS 26.3.0) Alamofire/5.10.2",
-    },
+/**
+ * Send a message to a tab's content script.
+ * Returns the response, or null if the content script isn't loaded yet.
+ */
+function sendToContentScript(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve(null); // not ready
+      } else {
+        resolve(response);
+      }
+    });
   });
-
-  if (!response.ok) {
-    throw new Error(`Key generation failed: ${response.status}`);
-  }
-
-  return await response.json();
 }
 
+/**
+ * Search Yuka's Algolia product index.
+ *
+ * Matches the format from curl 3:
+ *   POST /1/indexes/prod_product/query
+ *   Headers: X-Algolia-Application-Id only
+ *   Body:    { apiKey: "<secured_key>", params: "..." }
+ *
+ * The secured key already encodes filters (grades, countries, exclusions, etc.)
+ * so we only add query-level params in `params`.
+ */
 async function searchProducts(apiKey, query) {
-  const url = "https://m8ujg2x7hl-dsn.algolia.net/1/indexes/prod_product/query";
+  const params = [
+    "analytics=true",
+    `facets=${encodeURIComponent('["brand"]')}`,
+    "filters=statistics.us.scan_count%3E%3D10%20AND%20main_scan_countries:us",
+    "hitsPerPage=5",
+    `query=${encodeURIComponent(query)}`,
+  ].join("&");
 
-  const response = await fetch(url, {
+  const response = await fetch(ALGOLIA_ENDPOINT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Algolia-Application-Id": "M8UJG2X7HL",
-      "X-Algolia-API-Key": "98e6cf011633dee8dee398318c87e302",
+      "X-Algolia-Application-Id": ALGOLIA_APP_ID,
+      "User-Agent": "Algolia for Swift (7.0.5); iOS (26.3)",
+      "Accept-Language": "en-US,en;q=0.9",
     },
-    body: JSON.stringify({
-      apiKey: apiKey,
-      params: `analytics=true&facets=[%22brand%22]&hitsPerPage=5&query=${encodeURIComponent(query)}`,
-    }),
+    body: JSON.stringify({ apiKey, params }),
   });
 
   if (!response.ok) {
-    throw new Error(`Product search failed: ${response.status}`);
+    const body = await response.text().catch(() => "");
+    throw new Error(`Algolia search failed: ${response.status}${body ? " — " + body.slice(0, 120) : ""}`);
   }
 
   return await response.json();

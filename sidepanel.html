@@ -12,29 +12,29 @@
     <div class="login-container">
       <div class="logo-area">
         <div class="logo-icon">
-          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-            <circle cx="24" cy="24" r="24" fill="#3CC77A"/>
-            <path d="M14 20L22 32L34 14" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <img src="icons/icon128.png" width="64" height="64" alt="Yuka Scanner" />
         </div>
         <h1>Yuka Scanner</h1>
         <p class="subtitle">Scan products on any page and get health scores</p>
       </div>
 
       <div class="form-group">
-        <label for="token-input">Authentication Token</label>
+        <label for="token-input">Algolia API Key</label>
         <textarea
           id="token-input"
-          placeholder="Paste your Yuka/Firebase token here..."
-          rows="4"
+          placeholder="Paste your Algolia secured API key here..."
+          rows="5"
         ></textarea>
-        <p class="hint">Your token from the Yuka app. This is stored locally and used to authenticate API requests.</p>
+        <p class="hint">
+          Find this in the <code>apiKey</code> field of your Yuka API request body (the long base64 string).
+          It's stored locally and never sent anywhere except Algolia.
+        </p>
       </div>
 
       <button id="login-btn" class="btn-primary">
         <span class="btn-text">Connect</span>
         <span class="btn-loading hidden">
-          <span class="spinner"></span> Connecting...
+          <span class="spinner"></span> Verifying...
         </span>
       </button>
 
@@ -47,10 +47,7 @@
     <header>
       <div class="header-left">
         <div class="header-logo">
-          <svg width="24" height="24" viewBox="0 0 48 48" fill="none">
-            <circle cx="24" cy="24" r="24" fill="#3CC77A"/>
-            <path d="M14 20L22 32L34 14" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <img src="icons/icon128.png" width="28" height="28" alt="Yuka Scanner" />
         </div>
         <h2>Yuka Scanner</h2>
       </div>

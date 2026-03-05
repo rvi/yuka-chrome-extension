@@ -10,6 +10,7 @@
     "scripting"
   ],
   "host_permissions": [
+    "<all_urls>",
     "https://goodtoucan.com/*",
     "https://*.algolia.net/*"
   ],
