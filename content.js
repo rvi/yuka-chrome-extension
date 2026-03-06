@@ -9,8 +9,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 /**
  * Returns true if the element overlaps the viewport and isn't hidden.
- * Does NOT check opacity — cards on Target/Instacart animate in and can
- * have mid-transition opacity values that would cause false negatives.
  */
 function isInViewport(el) {
   const rect = el.getBoundingClientRect();
@@ -28,13 +26,57 @@ function isInViewport(el) {
 }
 
 /**
+ * Returns true if the element is in the main content area of the page,
+ * not inside a navigation bar, header, footer, sidebar, or modal.
+ */
+function isInMainContent(el) {
+  let node = el;
+  while (node && node !== document.body) {
+    const tag = node.tagName && node.tagName.toLowerCase();
+    if (tag === "nav" || tag === "header" || tag === "footer" || tag === "aside") return false;
+    const role = (node.getAttribute("role") || "").toLowerCase();
+    if (role === "navigation" || role === "banner" || role === "complementary") return false;
+    const cls = (node.className || "").toLowerCase();
+    const id  = (node.id || "").toLowerCase();
+    // Common nav/chrome class patterns
+    if (/\b(navbar|nav-bar|nav_bar|header|footer|sidebar|breadcrumb|modal|dialog|overlay|cookie|banner|account|login|menu|search-bar|facet|filter)\b/.test(cls + " " + id)) return false;
+    node = node.parentElement;
+  }
+  return true;
+}
+
+/**
+ * Returns true if the text looks like a product name.
+ * Rejects review summaries, nav strings, UI labels, and search hints.
+ */
+function looksLikeProductName(text) {
+  if (!isValidProductText(text)) return false;
+
+  // Starts with a digit → likely a rating, count, or price ("8 avis...", "3 pour 2€")
+  if (/^\d/.test(text.trim())) return false;
+
+  // Review/rating patterns (FR/EN)
+  if (/avis pour une note|note moyenne|sur\s+5|étoile|stars?\s+out\s+of/i.test(text)) return false;
+
+  // Search/navigation UI patterns
+  if (/affinez votre recherche|mon compte|se connecter|créer un compte|panier|livraison offerte|voir le panier/i.test(text)) return false;
+
+  // Parenthetical counts like "pain (428)" or filter labels
+  if (/\(\d+\)/.test(text)) return false;
+
+  // Colon-separated filter labels like "Marque : Nutella"
+  if (/^[\w\s]+\s*:\s*".+"/.test(text)) return false;
+
+  return true;
+}
+
+/**
  * Extract the most likely product name from a product link element.
- * Avoids using full textContent which includes price, rating, etc.
  */
 function getTextFromLink(a) {
-  // 1. aria-label on the link itself (cleanest — set for accessibility)
+  // 1. aria-label on the link (cleanest — set for accessibility, usually just the name)
   const aria = (a.getAttribute("aria-label") || "").trim();
-  if (isValidProductText(aria)) return aria;
+  if (looksLikeProductName(aria)) return aria;
 
   // 2. A child element explicitly labelled as title/name
   const titleChild = a.querySelector(
@@ -44,20 +86,55 @@ function getTextFromLink(a) {
   );
   if (titleChild) {
     const text = titleChild.textContent.trim();
-    if (isValidProductText(text)) return text;
+    if (looksLikeProductName(text)) return text;
   }
 
-  // 3. First non-empty line of text content (title is usually first in DOM order)
+  // 3. First non-empty line of text content
   const firstLine = (a.textContent || "")
     .split(/[\n\r]+/)
     .map((l) => l.trim())
-    .find((l) => isValidProductText(l));
+    .find((l) => looksLikeProductName(l));
   if (firstLine) return firstLine;
 
   return null;
 }
 
+/**
+ * If the page is a single-product detail page (identified by a JSON-LD
+ * @type:Product block), return just that product name.
+ * Returns null on listing/search pages.
+ */
+function extractDetailPageProduct() {
+  const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+  for (const script of scripts) {
+    try {
+      const name = findProductNameInJsonLd(JSON.parse(script.textContent));
+      if (name) return name;
+    } catch (e) { /* ignore */ }
+  }
+  return null;
+}
+
+function findProductNameInJsonLd(data) {
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const name = findProductNameInJsonLd(item);
+      if (name) return name;
+    }
+    return null;
+  }
+  if (data && typeof data === "object") {
+    if (data["@type"] === "Product" && data.name) return data.name.trim();
+    if (data["@graph"]) return findProductNameInJsonLd(data["@graph"]);
+  }
+  return null;
+}
+
 function extractProductNames() {
+  // On single-product detail pages use JSON-LD only — no DOM scraping.
+  const jsonLdProduct = extractDetailPageProduct();
+  if (jsonLdProduct) return [jsonLdProduct];
+
   const products = new Set();
 
   // ── Strategy 1: Explicit named selectors ──────────────────────────────────
@@ -78,7 +155,7 @@ function extractProductNames() {
     '#productTitle',
     // Walmart
     '[data-automation-id="product-title"]',
-    // Target — multiple variants seen across versions
+    // Target
     '[data-test="product-title"]',
     'a[data-test="product-title"]',
     '[data-test*="ProductTitle"]',
@@ -89,7 +166,6 @@ function extractProductNames() {
     '[data-testid="item-card-header"] span',
     '[data-testid*="item_name"]',
     '[data-testid*="product_name"]',
-    // Generic testid patterns
     '[data-testid*="product"][data-testid*="name"]',
     '[data-testid*="item"][data-testid*="name"]',
     // Misc
@@ -103,25 +179,23 @@ function extractProductNames() {
 
   for (const selector of selectors) {
     document.querySelectorAll(selector).forEach((el) => {
-      if (!isInViewport(el)) return;
+      if (!isInViewport(el) || !isInMainContent(el)) return;
       const text = (el.getAttribute("data-product-name") || el.textContent || "").trim();
-      if (isValidProductText(text)) products.add(text);
+      if (looksLikeProductName(text)) products.add(text);
     });
   }
 
   // ── Strategy 2: Product links ─────────────────────────────────────────────
-  // Detect <a href> pointing to product pages and extract the name cleanly
-  // (not the full textContent which includes price/rating noise).
   const productLinkPatterns = [
     /\/products?\//i,
     /\/items?\//i,
-    /\/p\//i,           // Target: /p/wonder-bread/-/A-12345
-    /\/dp\//i,          // Amazon: /dp/B00XXXXX
+    /\/p\//i,
+    /\/dp\//i,
     /[?&]product_id=/i,
   ];
 
   document.querySelectorAll("a[href]").forEach((a) => {
-    if (!isInViewport(a)) return;
+    if (!isInViewport(a) || !isInMainContent(a)) return;
     const href = a.getAttribute("href") || "";
     if (!productLinkPatterns.some((re) => re.test(href))) return;
     const text = getTextFromLink(a);
@@ -130,30 +204,24 @@ function extractProductNames() {
 
   // ── Strategy 3: aria-label on card elements ───────────────────────────────
   document.querySelectorAll(
-    '[aria-label][role="listitem"], [aria-label][role="article"], [aria-label][role="button"]'
+    '[aria-label][role="listitem"], [aria-label][role="article"]'
   ).forEach((el) => {
-    if (!isInViewport(el)) return;
+    // Dropped role="button" — too broad, picks up star ratings and nav buttons
+    if (!isInViewport(el) || !isInMainContent(el)) return;
     const text = (el.getAttribute("aria-label") || "").trim();
-    if (isValidProductText(text)) products.add(text);
+    if (looksLikeProductName(text)) products.add(text);
   });
 
   // ── Strategy 4: Heuristic — headings inside product containers ────────────
   document.querySelectorAll(
     '[class*="product"], [class*="item-card"], [class*="ItemCard"], [class*="ProductCard"]'
   ).forEach((container) => {
-    if (!isInViewport(container)) return;
+    if (!isInViewport(container) || !isInMainContent(container)) return;
     const heading = container.querySelector("h1, h2, h3, h4");
     if (heading && isInViewport(heading)) {
       const text = heading.textContent.trim();
-      if (isValidProductText(text) && !text.includes("\n")) products.add(text);
+      if (looksLikeProductName(text) && !text.includes("\n")) products.add(text);
     }
-  });
-
-  // ── Strategy 5: JSON-LD (single-product detail pages only) ───────────────
-  document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
-    try {
-      extractSingleProductFromJsonLd(JSON.parse(script.textContent), products);
-    } catch (e) { /* ignore */ }
   });
 
   return [...products].slice(0, 50);
@@ -166,19 +234,4 @@ function isValidProductText(text) {
     text.length < 200 &&
     !/^\s*$/.test(text)
   );
-}
-
-function extractSingleProductFromJsonLd(data, products) {
-  if (Array.isArray(data)) {
-    data.forEach((item) => extractSingleProductFromJsonLd(item, products));
-    return;
-  }
-  if (data && typeof data === "object") {
-    if (data["@type"] === "Product" && data.name) {
-      products.add(data.name.trim());
-    }
-    if (data["@graph"]) {
-      data["@graph"].forEach((item) => extractSingleProductFromJsonLd(item, products));
-    }
-  }
 }

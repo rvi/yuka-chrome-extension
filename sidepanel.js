@@ -260,10 +260,8 @@ function buildSearchQueries(name) {
     queries.push(sigWords.slice(0, 2).join(" "));           // first 2 sig words
     queries.push(sigWords.slice(-2).join(" "));             // last 2 sig words
   }
-  if (sigWords.length >= 2) {
-    queries.push(sigWords[sigWords.length - 1]);            // last sig word
-    queries.push(sigWords[0]);                              // first sig word
-  }
+  // No single-word sig-word fallbacks — too noisy (matches unrelated products).
+  // Real brand names are already caught by the ALL-CAPS extraction above.
 
   // Deduplicate (case-insensitive) while preserving order
   const seen = new Set();

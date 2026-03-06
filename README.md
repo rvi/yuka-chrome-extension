@@ -16,6 +16,9 @@ Scan products on any ecommerce page and get their Yuka health scores instantly, 
 - **Manual search** — Look up any product by name
 - **Summary bar** — Overview of scanned products by score category
 
+
+!(Example of the Yuka extension)[examples/amazon.png]
+
 ---
 
 ## Installation
