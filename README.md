@@ -126,6 +126,10 @@ Once the key expires you will start getting 403 errors. Simply re-capture a fres
 
 ---
 
+> **Disclaimer:** This extension was vibe coded with [Claude](https://claude.ai). Use at your own risk.
+
+---
+
 ## How the extension works
 
 1. **Content script** (`content.js`) — Injected into every page, it scans the DOM for product names using CSS selectors (Amazon, Walmart, Target, Instacart…), JSON-LD structured data (`@type: Product`), and heuristic container detection.
