@@ -126,10 +126,6 @@ Once the key expires you will start getting 403 errors. Simply re-capture a fres
 
 ---
 
-> **Disclaimer:** This extension was vibe coded with [Claude](https://claude.ai). Use at your own risk.
-
----
-
 ## How the extension works
 
 1. **Content script** (`content.js`) — Injected into every page, it scans the DOM for product names using CSS selectors (Amazon, Walmart, Target, Instacart…), JSON-LD structured data (`@type: Product`), and heuristic container detection.
@@ -139,3 +135,7 @@ Once the key expires you will start getting 403 errors. Simply re-capture a fres
 3. **Deduplication** — Results are deduplicated by Yuka product ID (`hashId`) so the same product appearing under different names on a page is only shown once.
 
 4. **Background service worker** (`background.js`) — Handles all network requests (Algolia search) to avoid CORS issues, since service workers have cross-origin fetch access granted via `host_permissions` in the manifest.
+
+---
+
+> **Disclaimer:** This extension was vibe coded with [Claude](https://claude.ai). Use at your own risk.
